@@ -2,6 +2,8 @@ import { Plugin, Notice, TFile, MarkdownView } from 'obsidian';
 import { MPView, VIEW_TYPE_MP } from './view';
 import { ThemeManager } from './themeManager';
 import { ThemeManagerView, VIEW_TYPE_THEME_MANAGER } from './themeManagerView';
+import { ThemePreviewView, VIEW_TYPE_THEME_PREVIEW } from './themePreviewView';
+import { ThemeCSSView, VIEW_TYPE_THEME_CSS } from './themeCSSView';
 import { SettingsManager } from './settings/settings';
 import { MPConverter } from './converter';
 import { DonateManager } from './donateManager';
@@ -59,6 +61,18 @@ export default class MPPublisherPlugin extends Plugin {
     this.registerView(
       VIEW_TYPE_THEME_MANAGER,
       (leaf) => new ThemeManagerView(leaf, this.themeManager, this.settingsManager, this),
+    );
+
+    // 注册主题预览视图
+    this.registerView(
+      VIEW_TYPE_THEME_PREVIEW,
+      (leaf) => new ThemePreviewView(leaf, this.themeManager),
+    );
+
+    // 注册 CSS 代码查看视图
+    this.registerView(
+      VIEW_TYPE_THEME_CSS,
+      (leaf) => new ThemeCSSView(leaf, this.themeManager),
     );
 
     // 添加功能按钮
