@@ -78,10 +78,20 @@ export class ThemeCSSView extends ItemView {
         // 工具栏：标题 | 状态 | 操作按钮
         const toolbar = container.createEl('div', { cls: 'mp-theme-css-toolbar' });
 
-        toolbar.createEl('span', {
-            text: theme.name,
-            cls: 'mp-theme-css-title',
-        });
+        let nameInput: HTMLInputElement | null = null;
+        if (this.isEditing && isLocalTheme) {
+            nameInput = toolbar.createEl('input', {
+                type: 'text',
+                cls: 'mp-theme-css-title-input',
+                value: theme.name,
+            });
+            nameInput.spellcheck = false;
+        } else {
+            toolbar.createEl('span', {
+                text: theme.name,
+                cls: 'mp-theme-css-title',
+            });
+        }
 
         toolbar.createEl('span', {
             text: this.isEditing ? '编辑中' : '只读',
@@ -123,11 +133,31 @@ export class ThemeCSSView extends ItemView {
                         return;
                     }
 
+                    const newName = nameInput?.value.trim() || theme.name;
+                    if (!/^[a-zA-Z0-9\-_\u4e00-\u9fff]+$/.test(newName)) {
+                        new Notice('名称只能包含字母、数字、连字符、下划线和中文');
+                        return;
+                    }
+
                     try {
-                        await this.themeManager.updateLocalTheme(theme.id, newCSS);
+                        let currentThemeId = theme.id;
+
+                        if (newName !== theme.name) {
+                            const success = await this.themeManager.renameLocalTheme(theme.id, newName);
+                            if (!success) {
+                                new Notice('重命名失败，名称可能已存在');
+                                return;
+                            }
+                            currentThemeId = `local-${newName}`;
+                            this.themeId = currentThemeId;
+                            this.themeName = newName;
+                        }
+
+                        await this.themeManager.updateLocalTheme(currentThemeId, newCSS);
                         this.isEditing = false;
                         this.editedCSS = '';
-                        new Notice(`已保存「${theme.name}」`);
+                        new Notice(`已保存「${newName}」`);
+                        (this.leaf as any).updateHeader?.();
                         this.renderCSS(container);
                     } catch (error) {
                         new Notice('保存失败: ' + (error as Error).message);

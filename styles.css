@@ -1712,6 +1712,24 @@ ol {
     color: var(--text-normal);
 }
 
+.mp-theme-css-title-input {
+    font-weight: 500;
+    font-size: 0.85em;
+    color: var(--text-normal);
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    outline: none;
+    width: auto;
+    min-width: 80px;
+    max-width: 200px;
+}
+
+.mp-theme-css-title-input:focus {
+    border-color: var(--interactive-accent);
+}
+
 .mp-theme-css-badge {
     font-size: 0.68em;
     padding: 2px 7px;
