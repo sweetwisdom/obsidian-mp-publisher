@@ -26,14 +26,25 @@
 
 /* 发布模态框样式 */
 .enhanced-publisher-publish-button {
-    background-color: #07c160;
-    color: white;
-    border: none;
-    padding: 10px 20px;
+    background-color: var(--interactive-accent);
+    color: var(--text-on-accent);
+    border: 1px solid var(--interactive-accent);
+    padding: 10px 28px;
     border-radius: 4px;
     cursor: pointer;
     font-size: 14px;
     margin-top: 10px;
+    min-width: 220px;
+}
+
+.enhanced-publisher-publish-button:hover:not(:disabled) {
+    background-color: var(--interactive-accent-hover);
+    border-color: var(--interactive-accent-hover);
+}
+
+.enhanced-publisher-publish-button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
 }
 
 .publish-button-container {
@@ -55,6 +66,25 @@
     background-color: var(--background-secondary);
     padding: 10px;
     box-sizing: border-box;
+}
+
+.cover-preview-idle {
+    border-style: dashed;
+}
+
+.cover-preview-loading {
+    border-style: solid;
+    border-color: var(--interactive-accent);
+}
+
+.cover-preview-success {
+    border-style: solid;
+    border-color: #2ea043;
+}
+
+.cover-preview-error {
+    border-style: solid;
+    border-color: #d73a49;
 }
 
 .cover-preview img {
@@ -158,6 +188,7 @@
 .material-item-selected {
     border-color: var(--interactive-accent);
     background-color: var(--interactive-accent-hover);
+    box-shadow: 0 0 0 1px var(--interactive-accent) inset;
 }
 
 .material-item img {

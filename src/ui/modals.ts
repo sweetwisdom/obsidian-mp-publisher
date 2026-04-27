@@ -1,15 +1,24 @@
 import { App, MarkdownView, Modal, Notice, Setting, TFile } from 'obsidian';
 import MPPlugin from '../main';
 import { markdownToHtml } from '../converter';
-import { WechatPublisher } from '../publisher/wechat';
+
+type CoverSourceMode = 'first-image' | 'frontmatter' | 'manual';
+
+interface ManualCoverSelection {
+	kind: 'wechat-material' | 'local-file';
+	mediaId?: string;
+	previewUrl: string;
+	fileName?: string;
+	fileData?: ArrayBuffer;
+}
 
 // 封面图选择模态框
 export class CoverImageModal extends Modal {
 	plugin: MPPlugin;
 	selectedMediaId: string = '';
-	onImageSelected: (mediaId: string) => void;
+	onImageSelected: (selection: ManualCoverSelection) => void;
 
-	constructor(app: App, plugin: MPPlugin, onImageSelected: (mediaId: string) => void) {
+	constructor(app: App, plugin: MPPlugin, onImageSelected: (selection: ManualCoverSelection) => void) {
 		super(app);
 		this.plugin = plugin;
 		this.onImageSelected = onImageSelected;
@@ -105,6 +114,16 @@ export class CoverImageModal extends Modal {
 		let currentPage = 0;
 		const pageSize = 20;
 		let totalCount = 0;
+		const selectedMaterialCache = sessionStorage.getItem('selected_material');
+		let preselectedMediaId = '';
+		if (selectedMaterialCache) {
+			try {
+				preselectedMediaId = JSON.parse(selectedMaterialCache)?.media_id || '';
+			} catch (error) {
+				console.error('解析已选封面缓存失败:', error);
+			}
+		}
+		this.selectedMediaId = preselectedMediaId || '';
 
 		// 加载素材库函数
 		const loadMaterialsPage = async (page: number) => {
@@ -147,6 +166,12 @@ export class CoverImageModal extends Modal {
 						text: material.name || '未命名素材',
 						cls: 'material-item-name'
 					});
+
+					if (this.selectedMediaId && material.media_id === this.selectedMediaId) {
+						materialItem.classList.remove('material-item-unselected');
+						materialItem.classList.add('material-item-selected');
+						materialConfirmButton.disabled = false;
+					}
 
 					// 点击选择素材
 					materialItem.addEventListener('click', () => {
@@ -274,7 +299,12 @@ export class CoverImageModal extends Modal {
 				return;
 			}
 			const material = JSON.parse(selectedMaterial);
-			this.onImageSelected(material.media_id);
+			this.onImageSelected({
+				kind: 'wechat-material',
+				mediaId: material.media_id,
+				previewUrl: material.url || '',
+				fileName: material.name || '',
+			});
 			this.close();
 		});
 
@@ -289,41 +319,17 @@ export class CoverImageModal extends Modal {
 			}
 
 			const fileInfo = JSON.parse(selectedFileInfo);
-
-			// 立即上传图片到微信获取 media_id
 			localConfirmButton.disabled = true;
-			localConfirmButton.textContent = '正在上传...';
+			localConfirmButton.textContent = '确认中...';
 
-			try {
-				const mediaId = await this.plugin.wechatPublisher.uploadImageToWechat(
-					selectedFileData,
-					fileInfo.name
-				);
-
-				if (!mediaId) {
-					new Notice('上传封面图失败，请重试');
-					localConfirmButton.disabled = false;
-					localConfirmButton.textContent = '确认';
-					return;
-				}
-
-				// 保存上传成功的图片信息
-				sessionStorage.setItem('selected_material', JSON.stringify({
-					media_id: mediaId,
-					url: previewImageUrl,
-					name: fileInfo.name,
-					isLocal: false  // 已经上传到微信，不再是本地图片
-				}));
-
-				this.onImageSelected(mediaId);
-				new Notice('封面图上传成功');
-				this.close();
-			} catch (error) {
-				console.error('上传封面图失败:', error);
-				new Notice('上传封面图失败：' + (error.message || '未知错误'));
-				localConfirmButton.disabled = false;
-				localConfirmButton.textContent = '确认';
-			}
+			this.onImageSelected({
+				kind: 'local-file',
+				previewUrl: previewImageUrl,
+				fileName: fileInfo.name,
+				fileData: selectedFileData,
+			});
+			new Notice('已选择本地封面图，发布时将自动上传');
+			this.close();
 		});
 
 		// 分页按钮事件
@@ -355,13 +361,189 @@ export class PublishModal extends Modal {
 	markdownView: MarkdownView;
 	titleInput: HTMLInputElement;
 	platformSelect: HTMLSelectElement;
+	coverSourceSelect: HTMLSelectElement;
 	coverImagePreview: HTMLElement;
 	selectedCoverMediaId: string = '';
+	selectedCoverMode: CoverSourceMode = 'first-image';
+	selectedCoverImagePath: string = '';
+	currentCoverPreviewUrl: string = '';
+	manualLocalCoverData: { fileName: string; fileData: ArrayBuffer; previewUrl: string } | null = null;
+
+	private readonly coverSourceLabel: Record<string, string> = {
+		'first-image': '正文第一张图',
+		frontmatter: 'Markdown 元数据',
+		manual: '手动选择',
+	};
 
 	constructor(app: App, plugin: MPPlugin, markdownView: MarkdownView) {
 		super(app);
 		this.plugin = plugin;
 		this.markdownView = markdownView;
+	}
+
+	private getFirstImageFromHtml(htmlContent: string): string {
+		const tempDiv = document.createElement('div');
+		tempDiv.innerHTML = htmlContent;
+		const firstImg = tempDiv.querySelector('img');
+		return firstImg?.getAttribute('src') || '';
+	}
+
+	private parseFirstImageFromMarkdown(markdown: string): string {
+		const wikiImage = markdown.match(/!\[\[([^\]]+)\]\]/);
+		if (wikiImage?.[1]) {
+			return this.normalizeFrontmatterImagePath(wikiImage[1]);
+		}
+
+		const markdownImage = markdown.match(/!\[[^\]]*\]\(([^)]+)\)/);
+		if (markdownImage?.[1]) {
+			return this.normalizeFrontmatterImagePath(markdownImage[1]);
+		}
+
+		return '';
+	}
+
+	private normalizeFrontmatterImagePath(raw: unknown): string {
+		if (typeof raw !== 'string') return '';
+		let value = raw.trim();
+		if (!value) return '';
+
+		if (value.startsWith('![[') || value.startsWith('[[')) {
+			value = value.replace(/^!?\[\[/, '').replace(/\]\]$/, '');
+		}
+		if (value.includes('|')) {
+			value = value.split('|')[0].trim();
+		}
+
+		value = value.replace(/^['"<]+|['">]+$/g, '').trim();
+		return value;
+	}
+
+	private getCoverFromFrontmatter(file: TFile): string {
+		const fileCache = this.app.metadataCache.getFileCache(file);
+		const frontmatter = fileCache?.frontmatter;
+		if (!frontmatter) return '';
+
+		const coverKeys = ['cover', 'cover_image', 'thumbnail', 'thumb', 'image'];
+		for (const key of coverKeys) {
+			const value = frontmatter[key];
+			if (typeof value === 'string') {
+				const normalized = this.normalizeFrontmatterImagePath(value);
+				if (normalized) return normalized;
+			}
+			if (Array.isArray(value)) {
+				const firstString = value.find((item) => typeof item === 'string');
+				const normalized = this.normalizeFrontmatterImagePath(firstString);
+				if (normalized) return normalized;
+			}
+		}
+
+		return '';
+	}
+
+	private async resolveImagePreviewUrl(imagePath: string, file: TFile): Promise<string> {
+		if (!imagePath) return '';
+
+		if (imagePath.startsWith('http') || imagePath.startsWith('data:image/')) {
+			return imagePath;
+		}
+
+		const cleanPath = decodeURIComponent(imagePath.split('?')[0] || imagePath)
+			.replace(/\\/g, '/')
+			.replace(/^\.\//, '')
+			.replace(/^\/+/, '')
+			.trim();
+		const fileName = cleanPath.split('/').pop() || cleanPath;
+		const directFile = this.app.vault.getAbstractFileByPath(cleanPath);
+		let linkedFile = directFile instanceof TFile ? directFile : this.app.metadataCache.getFirstLinkpathDest(cleanPath, file.path);
+		if (!linkedFile) {
+			linkedFile = this.app.metadataCache.getFirstLinkpathDest(fileName, file.path);
+		}
+		if (!linkedFile) return '';
+
+		return this.app.vault.getResourcePath(linkedFile);
+	}
+
+	private renderCoverPreview(
+		status: 'idle' | 'auto-detecting' | 'success' | 'uploading' | 'error',
+		_message: string,
+		imageUrl: string = '',
+	) {
+		const targetPreviewUrl = imageUrl || this.currentCoverPreviewUrl;
+		this.currentCoverPreviewUrl = targetPreviewUrl || '';
+
+		this.coverImagePreview.empty();
+		this.coverImagePreview.removeClass(
+			'cover-preview-idle',
+			'cover-preview-loading',
+			'cover-preview-success',
+			'cover-preview-error',
+		);
+
+		if (status === 'idle') this.coverImagePreview.addClass('cover-preview-idle');
+		if (status === 'auto-detecting' || status === 'uploading') this.coverImagePreview.addClass('cover-preview-loading');
+		if (status === 'success') this.coverImagePreview.addClass('cover-preview-success');
+		if (status === 'error') this.coverImagePreview.addClass('cover-preview-error');
+
+		if (targetPreviewUrl) {
+			const img = document.createElement('img');
+			img.className = 'preview-image';
+			img.src = targetPreviewUrl;
+			this.coverImagePreview.appendChild(img);
+		} else {
+			this.coverImagePreview.createSpan({ text: '暂无封面预览' });
+		}
+	}
+
+	private async resolveCoverCandidateByMode(
+		mode: CoverSourceMode,
+		file: TFile,
+		htmlContent: string,
+	): Promise<{ imagePath: string; previewUrl: string; sourceLabel: string }> {
+		if (mode === 'first-image') {
+			const imagePath = this.getFirstImageFromHtml(htmlContent) || this.parseFirstImageFromMarkdown(this.markdownView.getViewData());
+			if (!imagePath) return { imagePath: '', previewUrl: '', sourceLabel: this.coverSourceLabel['first-image'] };
+			return {
+				imagePath,
+				previewUrl: await this.resolveImagePreviewUrl(imagePath, file),
+				sourceLabel: this.coverSourceLabel['first-image'],
+			};
+		}
+
+		if (mode === 'frontmatter') {
+			const imagePath = this.getCoverFromFrontmatter(file);
+			if (!imagePath) return { imagePath: '', previewUrl: '', sourceLabel: this.coverSourceLabel.frontmatter };
+			return {
+				imagePath,
+				previewUrl: await this.resolveImagePreviewUrl(imagePath, file),
+				sourceLabel: this.coverSourceLabel.frontmatter,
+			};
+		}
+
+		if (this.manualLocalCoverData) {
+			return {
+				imagePath: '',
+				previewUrl: this.manualLocalCoverData.previewUrl,
+				sourceLabel: this.coverSourceLabel.manual,
+			};
+		}
+
+		const selectedMaterial = sessionStorage.getItem('selected_material');
+		if (selectedMaterial) {
+			try {
+				const material = JSON.parse(selectedMaterial);
+				if (material?.media_id || material?.url) {
+					return {
+						imagePath: '',
+						previewUrl: material.url || '',
+						sourceLabel: this.coverSourceLabel.manual,
+					};
+				}
+			} catch (error) {
+				console.error('解析手动封面缓存失败:', error);
+			}
+		}
+
+		return { imagePath: '', previewUrl: '', sourceLabel: this.coverSourceLabel.manual };
 	}
 
 	onOpen() {
@@ -416,46 +598,66 @@ export class PublishModal extends Modal {
 		draftCheckbox.disabled = true;
 		draftSetting.controlEl.appendChild(draftCheckbox);
 
-		// 封面图选择（仅对微信公众号显示）
-		const coverImageSetting = new Setting(contentEl)
-			.setName('封面图')
-			.setDesc('选择文章封面图');
+		const coverSourceSetting = new Setting(contentEl)
+			.setName('封面来源')
+			.setDesc('可手动指定封面来源，默认正文第一张图');
+		this.coverSourceSelect = document.createElement('select');
+		this.coverSourceSelect.className = 'enhanced-publisher-platform-selector';
+		[
+			{ value: 'first-image', text: '文中第一张图（默认）' },
+			{ value: 'frontmatter', text: '元数据 cover' },
+			{ value: 'manual', text: '手动选择' },
+		].forEach((option) => {
+			const el = document.createElement('option');
+			el.value = option.value;
+			el.text = option.text;
+			this.coverSourceSelect.appendChild(el);
+		});
+		this.coverSourceSelect.value = this.selectedCoverMode;
+		coverSourceSetting.controlEl.appendChild(this.coverSourceSelect);
 
-		// 创建封面图选择区域的容器
+		const coverImageSetting = new Setting(contentEl)
+			.setName('封面预览')
+			.setDesc('切换来源后会立即更新本地预览，发布时统一上传');
 		const coverImageContainer = document.createElement('div');
 		coverImageContainer.className = 'cover-container';
 
 		// 封面图预览区域
 		this.coverImagePreview = document.createElement('div');
 		this.coverImagePreview.className = 'cover-preview';
-		this.coverImagePreview.textContent = '无封面图';
+		this.renderCoverPreview('idle', '请先选择封面来源');
 
 		// 选择按钮
 		const selectCoverButton = document.createElement('button');
 		selectCoverButton.className = 'mod-cta';
-		selectCoverButton.textContent = '选择封面图';
+		selectCoverButton.textContent = '手动选择封面图';
 		selectCoverButton.addEventListener('click', () => {
 			// 打开封面图选择模态框
-			const coverImageModal = new CoverImageModal(this.app, this.plugin, (mediaId) => {
-				this.selectedCoverMediaId = mediaId;
+			const coverImageModal = new CoverImageModal(this.app, this.plugin, (selection) => {
+				this.selectedCoverMode = 'manual';
+				this.coverSourceSelect.value = 'manual';
 
-				// 更新预览区域
-				this.coverImagePreview.empty();
-				const img = document.createElement('img') as HTMLImageElement;
-				img.className = 'preview-image';
+				if (selection.kind === 'wechat-material') {
+					this.manualLocalCoverData = null;
+					this.selectedCoverMediaId = selection.mediaId || '';
+					sessionStorage.setItem('selected_material', JSON.stringify({
+						media_id: this.selectedCoverMediaId,
+						url: selection.previewUrl,
+						name: selection.fileName || '',
+					}));
+					this.renderCoverPreview('success', `已手动选择封面（${this.coverSourceLabel.manual}）`, selection.previewUrl);
+					return;
+				}
 
-				// 从sessionStorage获取选中的素材信息
-				const selectedMaterial = sessionStorage.getItem('selected_material');
-				if (selectedMaterial) {
-					const material = JSON.parse(selectedMaterial);
-					if (material.url) {
-						img.src = material.url;
-						this.coverImagePreview.appendChild(img);
-					} else {
-						this.coverImagePreview.textContent = '已选择封面图';
-					}
-				} else {
-					this.coverImagePreview.textContent = '已选择封面图';
+				if (selection.kind === 'local-file' && selection.fileData && selection.fileName) {
+					this.selectedCoverMediaId = '';
+					sessionStorage.removeItem('selected_material');
+					this.manualLocalCoverData = {
+						fileName: selection.fileName,
+						fileData: selection.fileData,
+						previewUrl: selection.previewUrl,
+					};
+					this.renderCoverPreview('success', `已手动选择封面（${this.coverSourceLabel.manual}）`, selection.previewUrl);
 				}
 			});
 			coverImageModal.open();
@@ -465,6 +667,58 @@ export class PublishModal extends Modal {
 		coverImageContainer.appendChild(selectCoverButton);
 
 		coverImageSetting.controlEl.appendChild(coverImageContainer);
+
+		const refreshCoverPreviewByMode = async () => {
+			if (!this.markdownView.file) return;
+			const file = this.markdownView.file;
+			const htmlContent = await markdownToHtml(
+				this.app,
+				this.markdownView.getViewData(),
+				file.path || '',
+				this.plugin.themeManager,
+				this.plugin.settings.convertMathToSVG,
+			);
+			const candidate = await this.resolveCoverCandidateByMode(this.selectedCoverMode, file, htmlContent);
+			this.selectedCoverImagePath = candidate.imagePath;
+
+			if (this.selectedCoverMode === 'manual') {
+				if (this.manualLocalCoverData) {
+					this.selectedCoverMediaId = '';
+					this.renderCoverPreview('success', `已手动选择封面（${candidate.sourceLabel}）`, this.manualLocalCoverData.previewUrl);
+					return;
+				}
+				const selectedMaterial = sessionStorage.getItem('selected_material');
+				if (selectedMaterial) {
+					try {
+						const material = JSON.parse(selectedMaterial);
+						this.selectedCoverMediaId = material.media_id || '';
+						this.renderCoverPreview('success', `已手动选择封面（${candidate.sourceLabel}）`, material.url || '');
+						return;
+					} catch (error) {
+						console.error('解析手动封面缓存失败:', error);
+					}
+				}
+				this.currentCoverPreviewUrl = '';
+				this.renderCoverPreview('idle', '请选择手动封面图');
+				return;
+			}
+
+			this.selectedCoverMediaId = '';
+			this.manualLocalCoverData = null;
+			if (candidate.imagePath) {
+				this.renderCoverPreview('success', `当前封面来源：${candidate.sourceLabel}`, candidate.previewUrl);
+			} else {
+				this.currentCoverPreviewUrl = '';
+				this.renderCoverPreview('error', `未匹配到${candidate.sourceLabel}，请切换来源或手动选择`);
+			}
+		};
+
+		this.coverSourceSelect.addEventListener('change', async () => {
+			this.selectedCoverMode = this.coverSourceSelect.value as CoverSourceMode;
+			await refreshCoverPreviewByMode();
+		});
+
+		void refreshCoverPreviewByMode();
 
 		// 创建发布按钮容器并居中
 		const publishButtonContainer = contentEl.createDiv({
@@ -480,75 +734,116 @@ export class PublishModal extends Modal {
 		publishButton.addEventListener('click', async () => {
 			const title = this.titleInput.value;
 			const platform = this.platformSelect.value;
-
 			if (!title) {
 				new Notice('请输入标题');
 				return;
 			}
-
-			if (platform === 'wechat' && !this.coverImagePreview.querySelector('img')) {
-				new Notice('请选择封面图');
-				return;
-			}
-
 			if (!this.markdownView.file) {
 				new Notice('无法获取当前文件');
 				return;
 			}
-
-			// 使用 markdownToHtml 渲染内容（通过 juice 内联 CSS，确保样式在公众号后台正确显示）
 			const content = this.markdownView.getViewData();
 			const htmlContent = await markdownToHtml(
 				this.app,
 				content,
-				this.markdownView.file?.path || '',
+				this.markdownView.file.path || '',
 				this.plugin.themeManager,
 				this.plugin.settings.convertMathToSVG,
 			);
-
-			if (platform === 'wechat') {
-				if (!this.plugin.settings.wechatAppId || !this.plugin.settings.wechatAppSecret) {
-					new Notice('请先在设置中配置微信公众号的AppID和AppSecret');
-					return;
-				}
-
-				// 检查是否选择了封面图
-				if (!this.selectedCoverMediaId) {
-					new Notice('请先选择封面图');
-					return;
-				}
-
-				try {
-					// 获取选中的封面图 media_id
-					const selectedMaterial = sessionStorage.getItem('selected_material');
-					if (selectedMaterial) {
-						const material = JSON.parse(selectedMaterial);
-						this.selectedCoverMediaId = material.media_id;
+			if (platform !== 'wechat') {
+				return;
+			}
+			if (!this.plugin.settings.wechatAppId || !this.plugin.settings.wechatAppSecret) {
+				new Notice('请先在设置中配置微信公众号的 AppID 和 AppSecret');
+				return;
+			}
+			try {
+				publishButton.disabled = true;
+				let coverMediaId = '';
+				if (this.selectedCoverMode === 'manual') {
+					if (this.manualLocalCoverData) {
+						this.renderCoverPreview('uploading', `正在上传封面（${this.coverSourceLabel.manual}）...`, this.manualLocalCoverData.previewUrl);
+						coverMediaId = await this.plugin.wechatPublisher.uploadImageToWechat(
+							this.manualLocalCoverData.fileData,
+							this.manualLocalCoverData.fileName,
+						);
+						if (!coverMediaId) {
+							this.renderCoverPreview('error', '手动封面上传失败，请重试');
+							new Notice('手动封面上传失败，请重试');
+							publishButton.textContent = '发布';
+							publishButton.disabled = false;
+							return;
+						}
+						this.selectedCoverMediaId = coverMediaId;
+					} else {
+						const selectedMaterial = sessionStorage.getItem('selected_material');
+						if (selectedMaterial) {
+							try {
+								coverMediaId = JSON.parse(selectedMaterial)?.media_id || '';
+							} catch (error) {
+								console.error('解析手动封面缓存失败:', error);
+							}
+						}
+						if (!coverMediaId) {
+							this.renderCoverPreview('error', '请先手动选择封面图');
+							new Notice('请先手动选择封面图');
+							publishButton.textContent = '发布';
+							publishButton.disabled = false;
+							return;
+						}
+						this.selectedCoverMediaId = coverMediaId;
 					}
-
-					// 再次检查 media_id 是否有效
-					if (!this.selectedCoverMediaId) {
-						new Notice('封面图 media_id 无效，请重新选择封面图');
+				} else {
+					const sourceLabel = this.coverSourceLabel[this.selectedCoverMode];
+					if (!this.selectedCoverImagePath) {
+						this.renderCoverPreview('error', `未匹配到${sourceLabel}，请切换来源或手动选择`);
+						new Notice(`未匹配到${sourceLabel}，请切换来源或手动选择`);
+						publishButton.textContent = '发布';
+						publishButton.disabled = false;
 						return;
 					}
-
-					publishButton.textContent = '正在发布...';
-					const success = await this.plugin.publishToWechat(
-						title,
-						htmlContent,
-						this.selectedCoverMediaId,
-						this.markdownView.file
+					this.renderCoverPreview('uploading', `正在上传封面（${sourceLabel}）...`);
+					coverMediaId = await this.plugin.wechatPublisher.getOrUploadCoverMediaId(
+						this.selectedCoverImagePath,
+						this.markdownView.file,
 					);
-
-					if (success) {
-						this.close();
+					if (!coverMediaId) {
+						this.renderCoverPreview('error', `${sourceLabel}上传失败，请重试或手动选择`);
+						new Notice(`${sourceLabel}上传失败，请重试或手动选择`);
+						publishButton.textContent = '发布';
+						publishButton.disabled = false;
+						return;
 					}
-				} catch (error) {
-					console.error('发布失败:', error);
-					new Notice('发布失败：' + (error.message || '未知错误'));
-					publishButton.disabled = false;
-					publishButton.textContent = '发布';
+					this.selectedCoverMediaId = coverMediaId;
 				}
+
+				if (!this.selectedCoverMediaId) {
+					this.renderCoverPreview('error', '封面未准备完成，请重试');
+					new Notice('封面未准备完成，请重试');
+					publishButton.textContent = '发布';
+					publishButton.disabled = false;
+					return;
+				}
+
+				publishButton.textContent = '正在发布...';
+				const success = await this.plugin.publishToWechat(
+					title,
+					htmlContent,
+					coverMediaId,
+					this.markdownView.file,
+				);
+				if (success) {
+					this.close();
+				} else {
+					publishButton.textContent = '发布';
+					publishButton.disabled = false;
+				}
+			} catch (error: any) {
+				console.error('发布失败:', error);
+				this.renderCoverPreview('error', '发布失败，请重试或手动重新选择封面');
+				new Notice('发布失败：' + (error?.message || '未知错误'));
+				publishButton.textContent = '发布';
+				publishButton.disabled = false;
 			}
 		});
 	}
@@ -558,3 +853,5 @@ export class PublishModal extends Modal {
 		contentEl.empty();
 	}
 } 
+
+

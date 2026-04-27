@@ -1,6 +1,6 @@
 import { App, Notice, requestUrl, TFile } from 'obsidian';
 import MPPlugin from '../main';
-import { DocumentMetadata, getOrCreateMetadata, isImageUploaded, addImageMetadata, updateMetadata, updateDraftMetadata, touchMetadata } from '../types/metadata';
+import { ImageMetadata, DocumentMetadata, getOrCreateMetadata, isImageUploaded, addImageMetadata, updateMetadata, updateDraftMetadata, touchMetadata } from '../types/metadata';
 import { Logger } from '../utils/logger';
 import { getProgressIndicator } from '../ui/ProgressIndicator';
 
@@ -381,6 +381,133 @@ export class WechatPublisher {
 
         return tempDiv.innerHTML;
     }
+
+    async getOrUploadCoverMediaId(imagePath: string, file: TFile): Promise<string> {
+        try {
+            const metadata = getOrCreateMetadata(this.plugin, file);
+            touchMetadata(metadata);
+
+            const imageMetadata = await this.getOrUploadImageMetadata(imagePath, file, metadata);
+            if (!imageMetadata) return '';
+
+            await updateMetadata(this.plugin, file, metadata);
+            return imageMetadata.media_id;
+        } catch (error) {
+            this.logger.error('获取封面图 media_id 失败:', error);
+            return '';
+        }
+    }
+
+    private async getOrUploadImageMetadata(
+        imagePath: string,
+        file: TFile,
+        metadata: DocumentMetadata,
+    ): Promise<ImageMetadata | null> {
+        // 1. Base64 Data URL
+        if (imagePath.startsWith('data:image/')) {
+            const match = imagePath.match(/^data:image\/(\w+);base64,(.+)$/);
+            if (!match) return null;
+
+            const ext = match[1];
+            const base64Data = match[2];
+            const fileName = `formula_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.${ext}`;
+
+            const binaryString = window.atob(base64Data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+
+            const uploadResult = await this.uploadImageAndGetUrl(bytes.buffer, fileName);
+            if (!uploadResult) return null;
+
+            return {
+                fileName,
+                url: uploadResult.url,
+                media_id: uploadResult.media_id,
+                uploadTime: Date.now(),
+            };
+        }
+
+        // 2. 网络图片
+        if (imagePath.startsWith('http')) {
+            let imageMetadata = isImageUploaded(metadata, imagePath);
+            if (!imageMetadata) {
+                const response = await requestUrl({ url: imagePath });
+                if (response.status !== 200) {
+                    this.logger.error(`下载图片失败: ${imagePath}, status: ${response.status}`);
+                    return null;
+                }
+
+                const fileName = imagePath.split('/').pop()?.split('?')[0] || `web_image_${Date.now()}.png`;
+                const uploadResult = await this.uploadImageAndGetUrl(response.arrayBuffer, fileName);
+                if (!uploadResult) return null;
+
+                imageMetadata = {
+                    fileName: imagePath,
+                    url: uploadResult.url,
+                    media_id: uploadResult.media_id,
+                    uploadTime: Date.now(),
+                };
+                addImageMetadata(metadata, imagePath, imageMetadata);
+            }
+            return imageMetadata;
+        }
+
+        // 3. 本地路径或 app:// 路径
+        const cleanPath = decodeURIComponent(imagePath.split('?')[0] || imagePath)
+            .replace(/\\/g, '/')
+            .replace(/^\.\//, '')
+            .replace(/^\/+/, '')
+            .trim();
+        const fileName = cleanPath.split('/').pop();
+        if (!fileName) return null;
+
+        // 优先查缓存（文件名、原始路径、解码后路径）
+        const cacheKeys = Array.from(new Set([fileName, imagePath, cleanPath, cleanPath.replace(/^\.\//, '')]));
+        for (const key of cacheKeys) {
+            const cached = isImageUploaded(metadata, key);
+            if (cached) return cached;
+        }
+
+        const directFile = this.plugin.app.vault.getAbstractFileByPath(cleanPath);
+        let linkedFile = directFile instanceof TFile
+            ? directFile
+            : this.plugin.app.metadataCache.getFirstLinkpathDest(cleanPath, file.path);
+        if (!linkedFile || !(linkedFile instanceof TFile)) {
+            linkedFile = this.plugin.app.metadataCache.getFirstLinkpathDest(fileName, file.path);
+        }
+        if (!linkedFile || !(linkedFile instanceof TFile)) {
+            linkedFile = this.plugin.app.metadataCache.getFirstLinkpathDest(cleanPath.replace(/^\.\//, ''), file.path);
+        }
+        if (!linkedFile || !(linkedFile instanceof TFile)) {
+            this.logger.error(`无法找到图片文件: ${cleanPath}`);
+            return null;
+        }
+
+        const arrayBuffer = await this.plugin.app.vault.readBinary(linkedFile);
+        const uploadResult = await this.uploadImageAndGetUrl(arrayBuffer, linkedFile.name);
+        if (!uploadResult) return null;
+
+        const imageMetadata: ImageMetadata = {
+            fileName: linkedFile.path,
+            url: uploadResult.url,
+            media_id: uploadResult.media_id,
+            uploadTime: Date.now(),
+        };
+
+        addImageMetadata(metadata, fileName, imageMetadata);
+        addImageMetadata(metadata, linkedFile.path, imageMetadata);
+        if (cleanPath !== fileName) {
+            addImageMetadata(metadata, cleanPath, imageMetadata);
+        }
+        if (imagePath !== cleanPath) {
+            addImageMetadata(metadata, imagePath, imageMetadata);
+        }
+
+        return imageMetadata;
+    }
+
     // 处理单个图片的辅助函数
     async processImage(
         imagePath: string,
@@ -388,102 +515,10 @@ export class WechatPublisher {
         metadata: DocumentMetadata,
     ): Promise<string | null> {
         try {
-            // 1. 处理 Base64 Data URL (通常是公式转换生成的)
-            if (imagePath.startsWith('data:image/')) {
-                const match = imagePath.match(/^data:image\/(\w+);base64,(.+)$/);
-                if (!match) return null;
+            const imageMetadata = await this.getOrUploadImageMetadata(imagePath, file, metadata);
+            if (!imageMetadata) return null;
 
-                const ext = match[1];
-                const base64Data = match[2];
-                const fileName = `formula_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.${ext}`;
-
-                // 将 base64 转换为 ArrayBuffer
-                const binaryString = window.atob(base64Data);
-                const bytes = new Uint8Array(binaryString.length);
-                for (let i = 0; i < binaryString.length; i++) {
-                    bytes[i] = binaryString.charCodeAt(i);
-                }
-                const arrayBuffer = bytes.buffer;
-
-                this.logger.debug(`上传生成的图片: ${fileName}`);
-                const uploadResult = await this.uploadImageAndGetUrl(arrayBuffer, fileName);
-                return uploadResult ? uploadResult.url : null;
-            }
-
-            // 2. 处理网络图片 (http/https)
-            if (imagePath.startsWith('http')) {
-                // 检查缓存
-                let imageMetadata = isImageUploaded(metadata, imagePath);
-                if (!imageMetadata) {
-                    this.logger.debug(`下载并上传网络图片: ${imagePath}`);
-                    try {
-                        const response = await requestUrl({ url: imagePath });
-                        if (response.status !== 200) {
-                            this.logger.error(`下载图片失败: ${imagePath}, status: ${response.status}`);
-                            return null;
-                        }
-
-                        const fileName = imagePath.split('/').pop()?.split('?')[0] || `web_image_${Date.now()}.png`;
-                        const uploadResult = await this.uploadImageAndGetUrl(response.arrayBuffer, fileName);
-
-                        if (!uploadResult) return null;
-
-                        imageMetadata = {
-                            fileName: imagePath, // 使用完整URL作为Key来缓存
-                            url: uploadResult.url,
-                            media_id: uploadResult.media_id,
-                            uploadTime: Date.now()
-                        };
-                        addImageMetadata(metadata, imagePath, imageMetadata);
-                        await updateMetadata(this.plugin, file, metadata);
-                    } catch (e) {
-                        this.logger.error(`处理网络图片异常: ${imagePath}`, e);
-                        return null;
-                    }
-                }
-                return imageMetadata.url;
-            }
-
-            // 3. 处理常规文件路径
-            // 从路径中获取文件名
-            let fileName = imagePath.split('/').pop();
-            if (!fileName) return null;
-
-            // 如果文件名包含查询参数，去除它们
-            if (fileName.includes('?')) {
-                fileName = fileName.split('?')[0];
-            }
-
-            // 检查图片是否已上传
-            let imageMetadata = isImageUploaded(metadata, fileName);
-
-            if (!imageMetadata) {
-                // 将app://格式的URL转换为vault相对路径
-                const linkedFile = this.plugin.app.metadataCache.getFirstLinkpathDest(fileName, file.path);
-                if (!linkedFile || !(linkedFile instanceof TFile)) {
-                    this.logger.error(`无法找到图片文件: ${fileName}`);
-                    return null;
-                }
-
-                // 读取图片数据
-                const arrayBuffer = await this.plugin.app.vault.readBinary(linkedFile);
-
-                // 上传图片到微信
-                const uploadResult = await this.uploadImageAndGetUrl(arrayBuffer, fileName);
-
-                if (!uploadResult) return null;
-
-                // 保存图片元数据
-                imageMetadata = {
-                    fileName,
-                    url: uploadResult.url,
-                    media_id: uploadResult.media_id,
-                    uploadTime: Date.now()
-                };
-                addImageMetadata(metadata, fileName, imageMetadata);
-                await updateMetadata(this.plugin, file, metadata);
-            }
-
+            await updateMetadata(this.plugin, file, metadata);
             return imageMetadata.url;
         } catch (error) {
             this.logger.error('处理图片时出错:', error);
