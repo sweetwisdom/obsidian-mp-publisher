@@ -20,6 +20,9 @@ export function cleanObsidianUIElements(element: HTMLElement): void {
             link.parentNode?.replaceChild(textNode, link);
         });
 
+        // 将外部链接转为“文字（地址）”，避免公众号丢弃或拦截超链接
+        convertExternalLinksToText(element);
+
         // 移除Obsidian特有的UI元素（使用更具体的选择器避免误删）
         const elementsToRemove = [
             '.copy-code-button',           // 代码块复制按钮
@@ -97,4 +100,60 @@ export function cleanObsidianUIElements(element: HTMLElement): void {
     } catch (error) {
         console.error('清理HTML内容时出错:', error);
     }
+}
+
+function convertExternalLinksToText(element: HTMLElement): void {
+    const links = Array.from(element.querySelectorAll('a[href]'));
+
+    links.forEach(link => {
+        // SVG/图表内部可能包含链接节点，替换成 HTML span 会破坏图表结构
+        if (link.closest('svg, .mermaid, .plantuml, pre.mermaid, pre.plantuml')) {
+            return;
+        }
+
+        const rawHref = (link.getAttribute('href') || '').trim();
+        const displayHref = getDisplayHref(rawHref);
+        const linkText = (link.textContent || '').trim();
+        const replacement = document.createElement('span');
+        replacement.className = 'mp-link-text';
+
+        while (link.firstChild) {
+            replacement.appendChild(link.firstChild);
+        }
+
+        if (shouldShowLinkAddress(rawHref, linkText, displayHref)) {
+            replacement.appendChild(document.createTextNode(`（${displayHref}）`));
+        } else if (!replacement.textContent?.trim() && displayHref) {
+            replacement.textContent = displayHref;
+        }
+
+        link.parentNode?.replaceChild(replacement, link);
+    });
+}
+
+function shouldShowLinkAddress(rawHref: string, linkText: string, displayHref: string): boolean {
+    if (!isPublicLink(rawHref) || !displayHref) {
+        return false;
+    }
+
+    const normalizedText = normalizeLinkText(linkText);
+    const normalizedHref = normalizeLinkText(displayHref);
+    const normalizedRawHref = normalizeLinkText(rawHref);
+
+    return normalizedText !== normalizedHref && normalizedText !== normalizedRawHref;
+}
+
+function isPublicLink(href: string): boolean {
+    return /^(https?:\/\/|ftp:\/\/|mailto:|tel:|\/\/)/i.test(href.trim());
+}
+
+function getDisplayHref(href: string): string {
+    return href
+        .trim()
+        .replace(/^mailto:/i, '')
+        .replace(/^tel:/i, '');
+}
+
+function normalizeLinkText(text: string): string {
+    return text.trim().replace(/\s+/g, ' ');
 }

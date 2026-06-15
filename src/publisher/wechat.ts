@@ -35,6 +35,19 @@ export class WechatPublisher {
         this.logger = Logger.getInstance(app);
     }
 
+    /**
+     * 根据文件名推断 MIME，避免将所有图片都声明为 image/jpeg 导致微信侧可能转码。
+     */
+    private getImageMimeType(fileName: string): string {
+        const lower = (fileName || '').toLowerCase();
+        if (lower.endsWith('.png')) return 'image/png';
+        if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+        if (lower.endsWith('.gif')) return 'image/gif';
+        if (lower.endsWith('.webp')) return 'image/webp';
+        if (lower.endsWith('.bmp')) return 'image/bmp';
+        return 'application/octet-stream';
+    }
+
     // 获取微信素材库列表（支持分页）
     async getWechatMaterials(
         page: number = 0,
@@ -220,9 +233,9 @@ export class WechatPublisher {
     ): Promise<{ url: string; media_id: string } | null> {
         try {
             const boundary = '----WebKitFormBoundary' + Math.random().toString(16).substring(2);
-            const blob = new Blob([imageData]);
+            const mimeType = this.getImageMimeType(fileName);
 
-            const formDataHeader = `--${boundary}\r\nContent-Disposition: form-data; name="media"; filename="${fileName}"\r\nContent-Type: image/jpeg\r\n\r\n`;
+            const formDataHeader = `--${boundary}\r\nContent-Disposition: form-data; name="media"; filename="${fileName}"\r\nContent-Type: ${mimeType}\r\n\r\n`;
             const formDataFooter = `\r\n--${boundary}--`;
 
             const headerArray = new TextEncoder().encode(formDataHeader);
